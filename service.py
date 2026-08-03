@@ -281,7 +281,7 @@ class AstrBotisiveTranslateService:
             {
                 "status": "ok" if self.started else "stopped",
                 "service": "astrbotisive-translate",
-                "version": "1.1.0",
+                "version": "1.1.1",
                 "admin_umo_configured": bool(self._admin_umo()),
                 "capture_standard_requests": bool(
                     self._section("reading").get("capture_standard_requests", True)

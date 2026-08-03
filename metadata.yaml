@@ -1,6 +1,6 @@
 name: astrbot_plugin_astrbotisivetranslate
 display_name: "AstrBot式翻译"
 description: "AstrBotisive Translate（AstrBot式翻译）- 对接 Immersive Translate，让 Bot 陪你读文章、翻译、批注并整理阅读上下文"
-version: 1.1.0
+version: 1.1.1
 author: Florance
 repo: https://github.com/FloranceYeh/astrbot_plugin_astrbotisivetranslate

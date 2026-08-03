@@ -74,6 +74,7 @@
   },
   "batching": {
     "description": "翻译请求合并",
+    "type": "object",
     "items": {
       "window_milliseconds": {
         "description": "请求收集时间（毫秒）",
