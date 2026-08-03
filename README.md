@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="AstrBotisive Translate Logo" width="180" />
+  <img src="logo-large.png" alt="AstrBotisive Translate Logo" width="180" />
 </p>
 
 <h1 align="center">AstrBot式翻译（AstrBotisive Translate）</h1>
