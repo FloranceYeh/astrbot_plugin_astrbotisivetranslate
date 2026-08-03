@@ -1,0 +1,212 @@
+{
+  "admin_umo": {
+    "description": "管理员 UMO",
+    "type": "string",
+    "hint": "唯一允许管理阅读记录的 AstrBot 会话标识。可在目标聊天中使用 /sid 获取。留空时仍可翻译，但不会保存、总结、主动投递或注入聊天上下文。",
+    "default": ""
+  },
+  "persona": {
+    "description": "翻译人格",
+    "type": "object",
+    "items": {
+      "persona_id": {
+        "description": "指定人格",
+        "type": "string",
+        "_special": "select_persona",
+        "hint": "翻译、批注、深读和阅读摘要统一使用该人格。留空时跟随 admin_umo 当前会话人格；没有可用会话人格时使用 AstrBot 默认人格。",
+        "default": ""
+      }
+    }
+  },
+  "server": {
+    "description": "HTTP 服务",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用 OpenAI 兼容接口",
+        "type": "bool",
+        "default": true
+      },
+      "host": {
+        "description": "监听地址",
+        "type": "string",
+        "hint": "Windows 本机使用 127.0.0.1；Docker 或局域网访问使用 0.0.0.0。非本机地址必须配置 API Key。",
+        "default": "127.0.0.1"
+      },
+      "port": {
+        "description": "监听端口",
+        "type": "int",
+        "default": 8756
+      },
+      "api_key": {
+        "description": "单用户 API Key",
+        "type": "string",
+        "hint": "Immersive Translate 使用 Authorization: Bearer <key> 访问。监听非本机地址时不能为空。",
+        "default": ""
+      },
+      "requests_per_minute": {
+        "description": "每分钟请求上限",
+        "type": "int",
+        "default": 120
+      },
+      "max_concurrency": {
+        "description": "最大模型并发数",
+        "type": "int",
+        "default": 4
+      },
+      "request_timeout_seconds": {
+        "description": "模型请求超时秒数",
+        "type": "int",
+        "default": 120
+      },
+      "max_request_bytes": {
+        "description": "最大请求体字节数",
+        "type": "int",
+        "default": 1048576
+      },
+      "allowed_origins": {
+        "description": "允许的浏览器来源",
+        "type": "list",
+        "hint": "需要跨域访问时填写明确的 Origin；默认不发送 CORS 许可，仅在理解风险时使用 *。",
+        "default": []
+      }
+    }
+  },
+  "providers": {
+    "description": "模型路由",
+    "type": "object",
+    "items": {
+      "translate_provider_id": {
+        "description": "纯翻译模型",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "astrbot-translate 使用的 Provider；留空时使用 admin_umo 当前模型，再回退到 AstrBot 默认模型。",
+        "default": ""
+      },
+      "annotate_provider_id": {
+        "description": "翻译批注模型",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "deep_read_provider_id": {
+        "description": "深度解读模型",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "summary_provider_id": {
+        "description": "阅读摘要模型",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "留空时回退到深度解读模型。",
+        "default": ""
+      }
+    }
+  },
+  "reading": {
+    "description": "阅读记录与摘要",
+    "type": "object",
+    "items": {
+      "capture_standard_requests": {
+        "description": "自动归档标准翻译请求",
+        "type": "bool",
+        "hint": "开启后按空闲窗口把原生 Immersive Translate 请求归为一次阅读。多个网页同时翻译可能被归入同一记录。",
+        "default": true
+      },
+      "reading_idle_timeout_minutes": {
+        "description": "阅读空闲结束时间（分钟）",
+        "type": "int",
+        "default": 30
+      },
+      "reading_summary_enabled": {
+        "description": "生成阅读摘要",
+        "type": "bool",
+        "default": true
+      },
+      "rolling_summary_trigger_chars": {
+        "description": "滚动摘要触发字符数",
+        "type": "int",
+        "default": 6000
+      },
+      "rolling_summary_max_chars": {
+        "description": "滚动摘要最大字符数",
+        "type": "int",
+        "default": 1600
+      },
+      "final_summary_max_chars": {
+        "description": "最终摘要最大字符数",
+        "type": "int",
+        "default": 3000
+      },
+      "summary_input_max_chars": {
+        "description": "单次摘要输入字符上限",
+        "type": "int",
+        "default": 24000
+      },
+      "summary_language": {
+        "description": "摘要语言",
+        "type": "string",
+        "default": "中文"
+      },
+      "send_summary_to_admin": {
+        "description": "结束后主动发送摘要",
+        "type": "bool",
+        "default": true
+      },
+      "inject_summary_into_context": {
+        "description": "摘要加入聊天上下文",
+        "type": "bool",
+        "default": true
+      },
+      "retention_days": {
+        "description": "阅读记录保留天数",
+        "type": "int",
+        "hint": "默认 30 天；设为 0 表示永久保留。",
+        "default": 30
+      }
+    }
+  },
+  "prompts": {
+    "description": "翻译与批注",
+    "type": "object",
+    "items": {
+      "preserve_client_prompts": {
+        "description": "保留客户端翻译提示词",
+        "type": "bool",
+        "hint": "保留 Immersive Translate 的目标语言、术语表和自定义提示词，同时注入防提示词劫持规则。",
+        "default": true
+      },
+      "annotation_count": {
+        "description": "最多批注条数",
+        "type": "int",
+        "default": 2
+      },
+      "annotation_max_chars": {
+        "description": "批注最大字符数",
+        "type": "int",
+        "default": 240
+      },
+      "deep_read_max_chars": {
+        "description": "深度解读最大字符数",
+        "type": "int",
+        "default": 600
+      },
+      "translate_extra_prompt": {
+        "description": "纯翻译附加规则",
+        "type": "text",
+        "default": ""
+      },
+      "annotate_extra_prompt": {
+        "description": "批注附加规则",
+        "type": "text",
+        "default": ""
+      },
+      "deep_read_extra_prompt": {
+        "description": "深读附加规则",
+        "type": "text",
+        "default": ""
+      }
+    }
+  }
+}
