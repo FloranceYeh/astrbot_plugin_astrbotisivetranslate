@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 from dataclasses import dataclass, field
 
@@ -109,6 +110,34 @@ class FakeContext:
         return True
 
 
+class BatchFakeContext(FakeContext):
+    async def llm_generate(self, **kwargs):
+        system_prompt = kwargs.get("system_prompt", "")
+        if "Process the JSON batch" not in system_prompt:
+            return await super().llm_generate(**kwargs)
+        self.calls.append(kwargs)
+        payload = json.loads(kwargs["contexts"][0].content)
+        return FakeResponse(
+            json.dumps(
+                {
+                    "items": [
+                        {"id": item["id"], "text": f"译文：{item['text']}"}
+                        for item in payload["items"]
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+
+
+class MalformedBatchContext(FakeContext):
+    async def llm_generate(self, **kwargs):
+        if "Process the JSON batch" not in kwargs.get("system_prompt", ""):
+            return await super().llm_generate(**kwargs)
+        self.calls.append(kwargs)
+        return FakeResponse("not valid batch JSON")
+
+
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -128,6 +157,11 @@ def make_config(port: int, *, api_key: str = "secret", host: str = "127.0.0.1"):
             "request_timeout_seconds": 10,
         },
         "providers": {},
+        "batching": {
+            "window_milliseconds": 10,
+            "max_requests": 16,
+            "max_characters": 12000,
+        },
         "reading": {
             "capture_standard_requests": True,
             "reading_summary_enabled": True,
@@ -163,9 +197,7 @@ async def test_openai_api_auth_models_persona_and_capture(tmp_path):
     context = FakeContext()
     store = ReadingStore(tmp_path / "readings.sqlite3")
     await store.open()
-    service = AstrBotisiveTranslateService(
-        context, make_config(port), store, _noop
-    )
+    service = AstrBotisiveTranslateService(context, make_config(port), store, _noop)
     assert await service.start() is True
     try:
         async with aiohttp.ClientSession() as client:
@@ -201,9 +233,9 @@ async def test_openai_api_auth_models_persona_and_capture(tmp_path):
                 assert payload["choices"][0]["message"]["content"] == "译文"
                 assert payload["usage"]["total_tokens"] == 8
 
-        assert "Speak as a careful literary critic." in context.calls[-1][
-            "system_prompt"
-        ]
+        assert (
+            "Speak as a careful literary critic." in context.calls[-1]["system_prompt"]
+        )
         assert "Translate into Chinese." in context.calls[-1]["system_prompt"]
         articles = await store.list_articles()
         assert len(articles) == 1
@@ -245,6 +277,113 @@ async def test_streaming_response_ends_with_done(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_compatible_concurrent_requests_share_one_provider_call(tmp_path):
+    context = BatchFakeContext()
+    store = ReadingStore(tmp_path / "readings.sqlite3")
+    await store.open()
+    config = make_config(free_port())
+    config["batching"]["window_milliseconds"] = 20
+    service = AstrBotisiveTranslateService(context, config, store, _noop)
+    try:
+        payloads = [
+            {
+                "model": "astrbot-translate",
+                "messages": [
+                    {"role": "system", "content": "Translate into Chinese."},
+                    {"role": "user", "content": source},
+                ],
+            }
+            for source in ("First paragraph.", "Second paragraph.", "Third paragraph.")
+        ]
+        results = await asyncio.gather(
+            *(service._generate(payload) for payload in payloads)
+        )
+
+        assert len(context.calls) == 1
+        assert [result[0] for result in results] == [
+            "译文：First paragraph.",
+            "译文：Second paragraph.",
+            "译文：Third paragraph.",
+        ]
+        assert sum(result[3]["total_tokens"] for result in results) == 8
+        assert "Translate into Chinese." in context.calls[0]["system_prompt"]
+        assert (
+            "Speak as a careful literary critic." in context.calls[0]["system_prompt"]
+        )
+    finally:
+        await service.stop()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_incompatible_requests_are_not_merged(tmp_path):
+    context = BatchFakeContext()
+    store = ReadingStore(tmp_path / "readings.sqlite3")
+    await store.open()
+    service = AstrBotisiveTranslateService(
+        context, make_config(free_port()), store, _noop
+    )
+    try:
+        translate, annotate = await asyncio.gather(
+            service._generate(
+                {
+                    "model": "astrbot-translate",
+                    "messages": [{"role": "user", "content": "First"}],
+                }
+            ),
+            service._generate(
+                {
+                    "model": "astrbot-annotate",
+                    "messages": [{"role": "user", "content": "Second"}],
+                }
+            ),
+        )
+
+        assert translate[0] == annotate[0] == "译文"
+        assert len(context.calls) == 2
+        assert all(
+            "Process the JSON batch" not in call["system_prompt"]
+            for call in context.calls
+        )
+    finally:
+        await service.stop()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_batch_response_falls_back_to_individual_calls(tmp_path):
+    context = MalformedBatchContext()
+    store = ReadingStore(tmp_path / "readings.sqlite3")
+    await store.open()
+    service = AstrBotisiveTranslateService(
+        context, make_config(free_port()), store, _noop
+    )
+    try:
+        results = await asyncio.gather(
+            *(
+                service._generate(
+                    {
+                        "model": "astrbot-translate",
+                        "messages": [{"role": "user", "content": source}],
+                    }
+                )
+                for source in ("First", "Second")
+            )
+        )
+
+        assert [result[0] for result in results] == ["译文", "译文"]
+        assert len(context.calls) == 3
+        assert "Process the JSON batch" in context.calls[0]["system_prompt"]
+        assert all(
+            "Process the JSON batch" not in call["system_prompt"]
+            for call in context.calls[1:]
+        )
+    finally:
+        await service.stop()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_finish_generates_and_delivers_once(tmp_path):
     delivered = []
 
@@ -275,9 +414,7 @@ async def test_concurrent_finish_generates_and_delivers_once(tmp_path):
             if "final reading note" in call.get("system_prompt", "")
         ]
         assert len(final_calls) == 1
-        assert "Speak as a careful literary critic." in final_calls[0][
-            "system_prompt"
-        ]
+        assert "Speak as a careful literary critic." in final_calls[0]["system_prompt"]
     finally:
         await service.stop()
         await store.close()
@@ -330,9 +467,7 @@ async def test_stale_automatic_session_rolls_over_without_mixing(tmp_path):
         )
         await store._connection().commit()
 
-        new_id = await service._record_translation(
-            "new source", "新译文", "translate"
-        )
+        new_id = await service._record_translation("new source", "新译文", "translate")
         assert new_id and new_id != "old-session"
         if service.tasks:
             await asyncio.gather(*list(service.tasks))

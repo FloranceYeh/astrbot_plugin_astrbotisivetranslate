@@ -179,6 +179,7 @@ class AstrBotisiveTranslatePlugin(Star):
         details = (
             f"HTTP 服务：{listener_state}\n"
             f"监听地址：{status['host']}:{status['port']}\n"
+            f"翻译请求合并窗口：{status['batch_window_milliseconds']} ms\n"
             f"标准请求自动归档：{capture_state}\n"
             f"翻译人格：{status['persona_id']}\n"
             f"admin_umo：{self._admin_umo()}"

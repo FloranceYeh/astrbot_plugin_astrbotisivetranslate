@@ -8,6 +8,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -17,6 +18,7 @@ from astrbot.core import logger
 from astrbot.core.agent.message import Message
 
 from .prompts import (
+    BATCH_SYSTEM_PROMPT,
     FINAL_SUMMARY_PROMPT,
     MODE_PROMPTS,
     MODELS,
@@ -25,6 +27,24 @@ from .prompts import (
 from .storage import ReadingStore
 
 CompletionCallback = Callable[[dict[str, Any]], Awaitable[None]]
+GenerationResult = tuple[str, str, str, dict[str, int]]
+
+
+@dataclass(slots=True)
+class BatchRequest:
+    """One compatible translation request waiting for a batch."""
+
+    mode: str
+    provider_id: str
+    contexts: list[Message]
+    client_system: list[str]
+    source_text: str
+    kwargs: dict[str, Any]
+    future: asyncio.Future[GenerationResult]
+
+
+class BatchResponseError(Exception):
+    """Indicate that a provider response cannot be mapped back to batch items."""
 
 
 class ApiError(Exception):
@@ -74,6 +94,10 @@ class AstrBotisiveTranslateService:
         self.start_error = ""
         self._request_times: deque[float] = deque()
         self._capture_lock = asyncio.Lock()
+        self._batch_lock = asyncio.Lock()
+        self._batch_pending: list[BatchRequest] = []
+        self._batch_flush_task: asyncio.Task | None = None
+        self._batch_futures: set[asyncio.Future[GenerationResult]] = set()
         self._summary_locks: dict[str, asyncio.Lock] = {}
         self._finish_locks: dict[str, asyncio.Lock] = {}
         server = self._section("server")
@@ -229,6 +253,14 @@ class AstrBotisiveTranslateService:
     async def stop(self) -> None:
         """Stop background work and release the HTTP listener."""
         self.started = False
+        if self._batch_flush_task is not None:
+            self._batch_flush_task.cancel()
+            await asyncio.gather(self._batch_flush_task, return_exceptions=True)
+            self._batch_flush_task = None
+        for future in list(self._batch_futures):
+            if not future.done():
+                future.cancel()
+        self._batch_pending.clear()
         if self.background_task is not None:
             self.background_task.cancel()
             await asyncio.gather(self.background_task, return_exceptions=True)
@@ -249,10 +281,14 @@ class AstrBotisiveTranslateService:
             {
                 "status": "ok" if self.started else "stopped",
                 "service": "astrbotisive-translate",
-                "version": "1.0.0",
+                "version": "1.1.0",
                 "admin_umo_configured": bool(self._admin_umo()),
                 "capture_standard_requests": bool(
                     self._section("reading").get("capture_standard_requests", True)
+                ),
+                "batch_window_milliseconds": max(
+                    0,
+                    int(self._section("batching").get("window_milliseconds", 200)),
                 ),
                 "listener": f"{server.get('host', '127.0.0.1')}:{server.get('port', 8756)}",
             }
@@ -462,28 +498,64 @@ class AstrBotisiveTranslateService:
             )
         return template
 
-    async def _generate(
-        self, payload: dict[str, Any]
-    ) -> tuple[str, str, str, dict[str, int]]:
-        model_id, mode = self._mode(payload.get("model"))
-        contexts, client_system, source_text = self._validate_messages(payload)
-        provider_id = await self._provider_id(mode)
-        server = self._section("server")
-        timeout = max(10, min(int(server.get("request_timeout_seconds", 120)), 600))
+    @staticmethod
+    def _generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
         for key in ("temperature", "top_p", "max_tokens"):
             if isinstance(payload.get(key), int | float):
                 kwargs[key] = payload[key]
+        return kwargs
+
+    @staticmethod
+    def _is_batchable(payload: dict[str, Any]) -> bool:
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return False
+        non_system = [
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") != "system"
+        ]
+        return len(non_system) == 1 and non_system[0].get("role") == "user"
+
+    @staticmethod
+    def _response_usage(response: Any) -> dict[str, int]:
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        response_usage = getattr(response, "usage", None)
+        if response_usage is not None:
+            usage = {
+                "prompt_tokens": int(getattr(response_usage, "input", 0) or 0),
+                "completion_tokens": int(getattr(response_usage, "output", 0) or 0),
+                "total_tokens": int(getattr(response_usage, "total", 0) or 0),
+            }
+        return usage
+
+    async def _call_provider(
+        self,
+        *,
+        provider_id: str,
+        mode: str,
+        contexts: list[Message],
+        system_prompt: str,
+        kwargs: dict[str, Any],
+    ) -> Any:
+        timeout = max(
+            10,
+            min(
+                int(self._section("server").get("request_timeout_seconds", 120)),
+                600,
+            ),
+        )
         try:
             await asyncio.wait_for(self._concurrency.acquire(), timeout=5)
         except TimeoutError as exc:
             raise ApiError(429, "Server is busy", "server_busy") from exc
         try:
-            response = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self.context.llm_generate(
                     chat_provider_id=provider_id,
                     contexts=contexts,
-                    system_prompt=await self._system_prompt(mode, client_system),
+                    system_prompt=system_prompt,
                     **kwargs,
                 ),
                 timeout=timeout,
@@ -504,20 +576,247 @@ class AstrBotisiveTranslateService:
         finally:
             self._concurrency.release()
 
+    async def _generate_direct(self, request: BatchRequest) -> GenerationResult:
+        response = await self._call_provider(
+            provider_id=request.provider_id,
+            mode=request.mode,
+            contexts=request.contexts,
+            system_prompt=await self._system_prompt(
+                request.mode, request.client_system
+            ),
+            kwargs=request.kwargs,
+        )
         text = str(response.completion_text or "").strip()
         if not text:
             raise ApiError(
                 502, "AstrBot provider returned empty text", "empty_response"
             )
-        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        response_usage = getattr(response, "usage", None)
-        if response_usage is not None:
-            usage = {
-                "prompt_tokens": int(getattr(response_usage, "input", 0) or 0),
-                "completion_tokens": int(getattr(response_usage, "output", 0) or 0),
-                "total_tokens": int(getattr(response_usage, "total", 0) or 0),
-            }
-        return text, source_text, mode, usage
+        return (
+            text,
+            request.source_text,
+            request.mode,
+            self._response_usage(response),
+        )
+
+    @staticmethod
+    def _batch_key(request: BatchRequest) -> tuple[Any, ...]:
+        return (
+            request.mode,
+            request.provider_id,
+            tuple(request.client_system),
+            tuple(sorted(request.kwargs.items())),
+        )
+
+    async def _enqueue_batch(self, request: BatchRequest) -> GenerationResult:
+        batching = self._section("batching")
+        window_ms = max(0, min(int(batching.get("window_milliseconds", 200)), 5000))
+        if window_ms <= 0:
+            return await self._generate_direct(request)
+
+        async with self._batch_lock:
+            self._batch_pending.append(request)
+            self._batch_futures.add(request.future)
+            request.future.add_done_callback(self._batch_futures.discard)
+            if self._batch_flush_task is None or self._batch_flush_task.done():
+                self._batch_flush_task = asyncio.create_task(
+                    self._flush_batches(window_ms / 1000),
+                    name="astrbotisive_translate_batch_flush",
+                )
+        return await request.future
+
+    async def _flush_batches(self, window_seconds: float) -> None:
+        await asyncio.sleep(window_seconds)
+        current_task = asyncio.current_task()
+        async with self._batch_lock:
+            pending, self._batch_pending = self._batch_pending, []
+            if self._batch_flush_task is current_task:
+                self._batch_flush_task = None
+
+        groups: dict[tuple[Any, ...], list[BatchRequest]] = {}
+        for request in pending:
+            if not request.future.cancelled():
+                groups.setdefault(self._batch_key(request), []).append(request)
+
+        batching = self._section("batching")
+        max_requests = max(1, min(int(batching.get("max_requests", 16)), 64))
+        max_chars = max(500, min(int(batching.get("max_characters", 12000)), 100000))
+        for group in groups.values():
+            chunk: list[BatchRequest] = []
+            chunk_chars = 0
+            for request in group:
+                request_chars = len(request.source_text)
+                if chunk and (
+                    len(chunk) >= max_requests
+                    or chunk_chars + request_chars > max_chars
+                ):
+                    self._schedule(self._process_batch(chunk))
+                    chunk = []
+                    chunk_chars = 0
+                chunk.append(request)
+                chunk_chars += request_chars
+            if chunk:
+                self._schedule(self._process_batch(chunk))
+
+    async def _process_batch(self, requests: list[BatchRequest]) -> None:
+        requests = [request for request in requests if not request.future.cancelled()]
+        if not requests:
+            return
+        try:
+            if len(requests) == 1:
+                results: list[GenerationResult | BaseException] = [
+                    await self._generate_direct(requests[0])
+                ]
+            else:
+                try:
+                    results = list(await self._generate_batch(requests))
+                except BatchResponseError as exc:
+                    logger.warning(
+                        "[AstrBot式翻译] Cannot split a batch of %s; retrying separately: %s",
+                        len(requests),
+                        exc,
+                    )
+                    results = await self._generate_individually(requests)
+        except asyncio.CancelledError:
+            for request in requests:
+                if not request.future.done():
+                    request.future.cancel()
+            raise
+        except Exception as exc:
+            results = [exc] * len(requests)
+
+        for request, result in zip(requests, results, strict=True):
+            if request.future.done():
+                continue
+            if isinstance(result, BaseException):
+                if isinstance(result, asyncio.CancelledError):
+                    request.future.cancel()
+                else:
+                    request.future.set_exception(result)
+            else:
+                request.future.set_result(result)
+
+    async def _generate_individually(
+        self, requests: list[BatchRequest]
+    ) -> list[GenerationResult | BaseException]:
+        concurrency = max(
+            1,
+            min(
+                int(self._section("server").get("max_concurrency", 4)),
+                32,
+            ),
+        )
+        results: list[GenerationResult | BaseException] = []
+        for start in range(0, len(requests), concurrency):
+            chunk = requests[start : start + concurrency]
+            results.extend(
+                await asyncio.gather(
+                    *(self._generate_direct(request) for request in chunk),
+                    return_exceptions=True,
+                )
+            )
+        return results
+
+    async def _generate_batch(
+        self, requests: list[BatchRequest]
+    ) -> list[GenerationResult]:
+        first = requests[0]
+        batch_payload = {
+            "items": [
+                {"id": str(index), "text": request.source_text}
+                for index, request in enumerate(requests)
+            ]
+        }
+        kwargs = dict(first.kwargs)
+        if isinstance(kwargs.get("max_tokens"), int):
+            kwargs["max_tokens"] = min(int(kwargs["max_tokens"]) * len(requests), 32768)
+        response = await self._call_provider(
+            provider_id=first.provider_id,
+            mode=first.mode,
+            contexts=[
+                Message(
+                    role="user",
+                    content=json.dumps(
+                        batch_payload, ensure_ascii=False, separators=(",", ":")
+                    ),
+                )
+            ],
+            system_prompt=(
+                f"{await self._system_prompt(first.mode, first.client_system)}\n\n"
+                f"{BATCH_SYSTEM_PROMPT}"
+            ),
+            kwargs=kwargs,
+        )
+        outputs = self._parse_batch_response(
+            str(response.completion_text or ""), len(requests)
+        )
+        logger.debug(
+            "[AstrBot式翻译] Combined %s requests mode=%s provider=%s",
+            len(requests),
+            first.mode,
+            first.provider_id,
+        )
+        usages = self._split_usage(self._response_usage(response), len(requests))
+        return [
+            (output, request.source_text, request.mode, usage)
+            for request, output, usage in zip(requests, outputs, usages, strict=True)
+        ]
+
+    @staticmethod
+    def _parse_batch_response(text: str, expected_count: int) -> list[str]:
+        candidate = text.strip()
+        fenced = re.fullmatch(
+            r"```(?:json)?\s*(.*?)\s*```",
+            candidate,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if fenced:
+            candidate = fenced.group(1)
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            raise BatchResponseError("response is not valid JSON") from exc
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or len(items) != expected_count:
+            raise BatchResponseError("response item count does not match the request")
+        outputs: list[str] = []
+        for index, item in enumerate(items):
+            if (
+                not isinstance(item, dict)
+                or item.get("id") != str(index)
+                or not isinstance(item.get("text"), str)
+                or not item["text"].strip()
+            ):
+                raise BatchResponseError(f"invalid response item {index}")
+            outputs.append(item["text"].strip())
+        return outputs
+
+    @staticmethod
+    def _split_usage(usage: dict[str, int], count: int) -> list[dict[str, int]]:
+        results = [
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            for _ in range(count)
+        ]
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            quotient, remainder = divmod(max(0, usage[key]), count)
+            for index in range(count):
+                results[index][key] = quotient + (1 if index < remainder else 0)
+        return results
+
+    async def _generate(self, payload: dict[str, Any]) -> GenerationResult:
+        _, mode = self._mode(payload.get("model"))
+        contexts, client_system, source_text = self._validate_messages(payload)
+        request = BatchRequest(
+            mode=mode,
+            provider_id=await self._provider_id(mode),
+            contexts=contexts,
+            client_system=client_system,
+            source_text=source_text,
+            kwargs=self._generation_kwargs(payload),
+            future=asyncio.get_running_loop().create_future(),
+        )
+        if not self._is_batchable(payload):
+            return await self._generate_direct(request)
+        return await self._enqueue_batch(request)
 
     async def _chat_completions(self, request: web.Request) -> web.StreamResponse:
         payload = await self._body(request)
@@ -859,6 +1158,7 @@ class AstrBotisiveTranslateService:
     def status(self) -> dict[str, Any]:
         """Return command-friendly runtime status."""
         server = self._section("server")
+        batching = self._section("batching")
         return {
             "started": self.started,
             "error": self.start_error,
@@ -870,5 +1170,8 @@ class AstrBotisiveTranslateService:
             ),
             "capture": bool(
                 self._section("reading").get("capture_standard_requests", True)
+            ),
+            "batch_window_milliseconds": max(
+                0, min(int(batching.get("window_milliseconds", 200)), 5000)
             ),
         }

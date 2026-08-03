@@ -72,6 +72,29 @@
       }
     }
   },
+  "batching": {
+    "description": "翻译请求合并",
+    "items": {
+      "window_milliseconds": {
+        "description": "请求收集时间（毫秒）",
+        "type": "int",
+        "hint": "从首个请求开始等待这段时间，将期间收到的兼容请求合并为一次模型调用。设为 0 表示关闭；建议 100-500。",
+        "default": 200
+      },
+      "max_requests": {
+        "description": "单批最大请求数",
+        "type": "int",
+        "hint": "超过后自动拆成多个批次，允许范围 1-64。",
+        "default": 16
+      },
+      "max_characters": {
+        "description": "单批原文字符上限",
+        "type": "int",
+        "hint": "避免合并后的请求超过模型上下文，最低 500。",
+        "default": 12000
+      }
+    }
+  },
   "providers": {
     "description": "模型路由",
     "type": "object",

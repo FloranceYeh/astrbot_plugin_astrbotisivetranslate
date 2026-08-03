@@ -19,6 +19,7 @@ AstrBotisive Translate 是一款对接 Immersive Translate 的 AstrBot 插件。
 - `astrbot-deep-read`：返回译文、`〔解读〕` 和必要的 `〔提示〕`。
 - 翻译、批注、深读和摘要统一使用配置中指定的 AstrBot 人格；留空时跟随 `admin_umo` 当前会话人格，再回退到默认人格。
 - 支持 `/v1/chat/completions` 非流式与 SSE 流式响应。
+- 在可配置的毫秒级窗口内合并兼容翻译请求，减少网页多段落产生的 LLM 调用次数。
 - 标准 Immersive Translate 请求可按空闲窗口自动归为一次阅读。
 - SQLite 保存原文、译文、批注、滚动摘要与最终摘要，默认保留 30 天。
 - 阅读结束后可向 `admin_umo` 主动发送摘要，并写入当前 AstrBot 对话上下文。
@@ -33,8 +34,9 @@ AstrBotisive Translate 是一款对接 Immersive Translate 的 AstrBot 插件。
 1. 在希望继续讨论文章的聊天中发送 `/sid`，把得到的完整 UMO 填入 `admin_umo`。
 2. 在“翻译人格”中选择一个 AstrBot 人格。留空时跟随 `admin_umo` 当前会话人格，再回退到 AstrBot 默认人格。
 3. 为三个翻译模式和摘要分别选择 AstrBot Provider。留空时使用 `admin_umo` 当前 Provider，再回退到默认 Provider。
-4. Windows 本机使用 `server.host = 127.0.0.1`。Docker 使用 `0.0.0.0` 并映射 `server.port`。
-5. 只要监听地址不是本机回环地址，`server.api_key` 就必须设置，否则 HTTP 服务拒绝启动。
+4. “请求收集时间”默认 `200 ms`。同一模式、Provider、客户端提示词和生成参数的并发请求会合并；设为 `0` 可关闭。
+5. Windows 本机使用 `server.host = 127.0.0.1`。Docker 使用 `0.0.0.0` 并映射 `server.port`。
+6. 只要监听地址不是本机回环地址，`server.api_key` 就必须设置，否则 HTTP 服务拒绝启动。
 
 `admin_umo` 留空时，纯翻译接口仍能工作，但阅读保存、摘要、主动消息、上下文注入和聊天命令全部关闭。
 
