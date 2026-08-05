@@ -115,3 +115,7 @@ data/plugin_data/astrbot_plugin_astrbotisivetranslate/
 ```
 
 `/ait forget` 会删除指定文章及所有片段。保留天数设为 `0` 时不会自动清理。
+
+## 许可证
+
+本项目基于 [GNU General Public License v3.0](LICENSE) 授权。
