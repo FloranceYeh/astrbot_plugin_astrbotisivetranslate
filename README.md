@@ -8,8 +8,6 @@
 
 > 喜欢本插件的朋友可以点一个 `Star⭐`，也欢迎在 Issues 里提出建议或反馈问题。欢迎提交 PR，帮助完善功能或修复问题。
 
-> 欢迎加入群聊（1094990582）讨论插件使用、功能建议和问题反馈，也欢迎交流 LLM、Prompt 与 AstrBot 开发。
-
 AstrBotisive Translate 是一款对接 Immersive Translate 的 AstrBot 插件。它把 AstrBot 中已经配置的 LLM 作为 OpenAI 兼容翻译服务，并在单用户模式下保存阅读记录、生成批注与摘要。
 
 ## 功能
